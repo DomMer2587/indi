@@ -27,7 +27,9 @@
 #include "indicom.h"
 #include "connectionplugins/connectionserial.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <regex>
@@ -43,7 +45,7 @@ static std::unique_ptr<PegasusFlatMasterNeo> flatmaster(new PegasusFlatMasterNeo
 
 PegasusFlatMasterNeo::PegasusFlatMasterNeo() : LightBoxInterface(this), DustCapInterface(this), WeatherInterface(this)
 {
-    setVersion(1, 2);
+    setVersion(1, 3);
 }
 
 bool PegasusFlatMasterNeo::initProperties()
@@ -66,7 +68,7 @@ bool PegasusFlatMasterNeo::initProperties()
     setCriticalParameter("WEATHER_TEMPERATURE");
 
     WeatherOffsetNP[OFFSET_TEMPERATURE].fill("OFFSET_TEMPERATURE", "Temperature Offset (C)", "%.1f", -20, 20, 0.1, 0);
-    WeatherOffsetNP[OFFSET_HUMIDITY].fill(   "OFFSET_HUMIDITY",    "Humidity Offset (%)",    "%.1f", -20, 20, 0.1, 0);
+    WeatherOffsetNP[OFFSET_HUMIDITY].fill(   "OFFSET_HUMIDITY",    "Humidity Offset (%)",    "%.0f", -50, 50, 1, 0);
     WeatherOffsetNP.fill(getDeviceName(), "WEATHER_OFFSET", "Calibration", ENVIRONMENT_TAB, IP_RW, 60, IPS_IDLE);
 
     LightIntensityNP[0].setMin(0);
@@ -294,44 +296,21 @@ bool PegasusFlatMasterNeo::Ack()
 
 bool PegasusFlatMasterNeo::EnableLightBox(bool enable)
 {
-    char response[16] = {0};
     char cmd[16] = {0};
-
     snprintf(cmd, 16, "FE:%d", enable ? 1 : 0);
-
-    if (!sendCommand(cmd, response))
-    {
-        LOGF_ERROR("EnableLightBox: send failed. %s", response);
-        return false;
-    }
-
-    if (strstr(response, "FE:") == nullptr)
-    {
-        LOGF_ERROR("EnableLightBox: unexpected response '%s'", response);
-        return false;
-    }
-
-    return true;
+    return sendEchoCommand(cmd);
 }
 
 bool PegasusFlatMasterNeo::SetLightBoxBrightness(uint16_t value)
 {
-    char response[16] = {0};
     char cmd[16] = {0};
-
     snprintf(cmd, 16, "FL:%d", value);
-
-    if (!sendCommand(cmd, response))
-    {
-        LOGF_ERROR("SetLightBoxBrightness: send failed. %s", response);
+    if (!sendEchoCommand(cmd))
         return false;
-    }
 
-    if (strstr(response, "FL:") == nullptr)
-    {
-        LOGF_ERROR("SetLightBoxBrightness: unexpected response '%s'", response);
-        return false;
-    }
+    // Brightness 0 also switches the panel off, as the Pegasus software does.
+    if (value == 0)
+        return EnableLightBox(false);
 
     return true;
 }
@@ -385,14 +364,14 @@ bool PegasusFlatMasterNeo::ISNewNumber(const char *dev, const char *name, double
                 else if (strcmp(names[i], "OFFSET_HUMIDITY") == 0)
                     ok &= setHumidityOffset(values[i]);
             }
-            if (ok)
+            // Show the offsets the device actually uses.
+            if (!getWeatherOffsets())
+                ok = false;
+            if (!ok)
             {
-                WeatherOffsetNP.update(values, names, n);
-                WeatherOffsetNP.setState(IPS_OK);
-            }
-            else
                 WeatherOffsetNP.setState(IPS_ALERT);
-            WeatherOffsetNP.apply();
+                WeatherOffsetNP.apply();
+            }
             return true;
         }
 
@@ -590,17 +569,12 @@ bool PegasusFlatMasterNeo::saveConfigItems(FILE *fp)
     INDI::DefaultDevice::saveConfigItems(fp);
     LI::saveConfigItems(fp);
     WI::saveConfigItems(fp);
-    WeatherOffsetNP.save(fp);
-    DewHeaterNP.save(fp);
-    AutoDewSP.save(fp);
-    DewAggressivenessNP.save(fp);
-    ThresholdNP.save(fp);
-    CapAngleNP.save(fp);
-    WifiChannelNP.save(fp);
+    // Dew, cap, offset and WiFi settings are stored in the device and read from it on
+    // connection. Saving them here would send old values back every time the config loads.
     return true;
 }
 
-bool PegasusFlatMasterNeo::sendCommand(const char *command, char *res, int timeout_sec)
+bool PegasusFlatMasterNeo::sendCommandBuffer(const char *command, char *res, int res_len, int timeout_sec)
 {
     int nbytes_written = 0, nbytes_read = 0, rc = -1;
     char errstr[MAXRBUF];
@@ -619,10 +593,21 @@ bool PegasusFlatMasterNeo::sendCommand(const char *command, char *res, int timeo
         return false;
     }
 
-    if ((rc = tty_read_section(PortFD, res, 0xA, timeout_sec, &nbytes_read)) != TTY_OK)
+    // Leave room for the terminating zero.
+    if ((rc = tty_nread_section(PortFD, res, res_len - 1, 0xA, timeout_sec, &nbytes_read)) != TTY_OK)
     {
         tty_error_msg(rc, errstr, MAXRBUF);
-        LOGF_ERROR("command: %s error: %s.", cmd, errstr);
+        LOGF_ERROR("command: %s error: %s.", command, errstr);
+        res[0] = 0;
+        // Discard the rest of a reply that did not fit, so the next reply starts clean.
+        if (rc == TTY_OVERFLOW)
+        {
+            char discard[256];
+            int discarded = 0;
+            while (tty_nread_section(PortFD, discard, sizeof(discard), 0xA, 1, &discarded) == TTY_OVERFLOW)
+                ;
+        }
+        tcflush(PortFD, TCIOFLUSH);
         return false;
     }
 
@@ -638,37 +623,53 @@ bool PegasusFlatMasterNeo::sendCommand(const char *command, char *res, int timeo
     return true;
 }
 
-IPState PegasusFlatMasterNeo::ParkCap()
+bool PegasusFlatMasterNeo::sendEchoCommand(const char *cmd)
 {
-    char response[16] = {0};
+    char response[32] = {0};
+    if (!sendCommand(cmd, response))
+        return false;
 
-    if (!sendCommand("FS:0", response))
+    if (strcmp(response, cmd) != 0)
     {
-        LOGF_ERROR("Error on ParkCap. %s", response);
-        return IPS_ALERT;
+        LOGF_ERROR("Unexpected response to %s: '%s'", cmd, response);
+        return false;
     }
 
-    if (strstr(response, "FS:") == nullptr)
+    return true;
+}
+
+bool PegasusFlatMasterNeo::isWifiReplyOk(const char *response)
+{
+    return response[0] != 0 && strcmp(response, "0") != 0;
+}
+
+// FA reports the aggressiveness either as level 0..10 or as the byte 9..255 sent with PD.
+uint8_t PegasusFlatMasterNeo::aggressivenessLevel(double value)
+{
+    if (value <= 10)
+        return static_cast<uint8_t>(std::max(0.0, value));
+    return static_cast<uint8_t>(std::min(10.0, std::max(0.0, round((value - 9) * 10.0 / 246.0))));
+}
+
+IPState PegasusFlatMasterNeo::ParkCap()
+{
+    if (!sendEchoCommand("FS:0"))
         return IPS_ALERT;
 
     // Command accepted — cap is now moving; TimerHit will finalize the state
+    m_CapTarget = CAP_STATUS_PARKED;
+    m_CapMoveStarted = std::chrono::steady_clock::now();
     return IPS_BUSY;
 }
 
 IPState PegasusFlatMasterNeo::UnParkCap()
 {
-    char response[16] = {0};
-
-    if (!sendCommand("FS:1", response))
-    {
-        LOGF_ERROR("Error on UnParkCap. %s", response);
-        return IPS_ALERT;
-    }
-
-    if (strstr(response, "FS:") == nullptr)
+    if (!sendEchoCommand("FS:1"))
         return IPS_ALERT;
 
     // Command accepted — cap is now moving; TimerHit will finalize the state
+    m_CapTarget = CAP_STATUS_UNPARKED;
+    m_CapMoveStarted = std::chrono::steady_clock::now();
     return IPS_BUSY;
 }
 
@@ -683,20 +684,16 @@ IPState PegasusFlatMasterNeo::AbortCap()
 bool PegasusFlatMasterNeo::setDewHeater(uint8_t value)
 {
     char cmd[16] = {0};
-    char response[16] = {0};
     snprintf(cmd, 16, "DH:%d", value);
-    if (sendCommand(cmd, response))
-        return strstr(response, "DH:") != nullptr;
-    return false;
+    return sendEchoCommand(cmd);
 }
 
 bool PegasusFlatMasterNeo::setAutoDew(bool enable)
 {
     char cmd[16] = {0};
-    char response[16] = {0};
     snprintf(cmd, 16, "PD:%d", enable ? 1 : 0);
 
-    if (!sendCommand(cmd, response) || strstr(response, "PD:") == nullptr)
+    if (!sendEchoCommand(cmd))
         return false;
 
     if (!getStatusData())
@@ -715,11 +712,8 @@ bool PegasusFlatMasterNeo::setAutoDew(bool enable)
 bool PegasusFlatMasterNeo::setCapAngle(uint16_t angle)
 {
     char cmd[16] = {0};
-    char response[16] = {0};
     snprintf(cmd, 16, "CD:%d", angle);
-    if (sendCommand(cmd, response))
-        return strstr(response, "CD:") != nullptr;
-    return false;
+    return sendEchoCommand(cmd);
 }
 
 void PegasusFlatMasterNeo::TimerHit()
@@ -783,7 +777,7 @@ bool PegasusFlatMasterNeo::getStatusData()
         DeviceStatusNP[STATUS_CAP_STATUS].setValue(capStatus);
         DeviceStatusNP[STATUS_DEW_POWER].setValue(dewPower);
         DeviceStatusNP[STATUS_AUTO_DEW].setValue(autoDew);
-        DeviceStatusNP[STATUS_DEW_AGGRESSIVE].setValue(dewAggressive);
+        DeviceStatusNP[STATUS_DEW_AGGRESSIVE].setValue(aggressivenessLevel(dewAggressive));
         DeviceStatusNP[STATUS_LIGHT_SENSOR].setValue(lightSensor);
         DeviceStatusNP.setState(IPS_OK);
         DeviceStatusNP.apply();
@@ -807,7 +801,20 @@ bool PegasusFlatMasterNeo::getStatusData()
         // --- DustCap interface ---
         // Any other value (e.g. in-motion) leaves IPS_BUSY in place until the
         // final state arrives; the switch selection is not changed mid-motion.
-        if (capStatus == CAP_STATUS_PARKED)
+        if (ParkCapSP.getState() == IPS_BUSY && (capStatus == CAP_STATUS_PARKED || capStatus == CAP_STATUS_UNPARKED)
+                && capStatus != m_CapTarget)
+        {
+            // Right after FS:x the cap may still report the old end position.
+            if (std::chrono::steady_clock::now() - m_CapMoveStarted > CAP_START_TIMEOUT)
+            {
+                LOGF_ERROR("Cap did not move, it is still %s.", capStatus == CAP_STATUS_PARKED ? "closed" : "open");
+                ParkCapSP.reset();
+                ParkCapSP[capStatus == CAP_STATUS_PARKED ? CAP_PARK : CAP_UNPARK].setState(ISS_ON);
+                ParkCapSP.setState(IPS_ALERT);
+                ParkCapSP.apply();
+            }
+        }
+        else if (capStatus == CAP_STATUS_PARKED)
         {
             if (ParkCapSP[CAP_PARK].getState() != ISS_ON || ParkCapSP.getState() != IPS_OK)
             {
@@ -832,6 +839,29 @@ bool PegasusFlatMasterNeo::getStatusData()
             CapAngleNP[0].setValue(capTargetAngle);
             CapAngleNP.setState(IPS_OK);
             CapAngleNP.apply();
+        }
+
+        // --- Dew controls: follow the device, which may also be set from Pegasus Unity ---
+        if (DewHeaterNP[0].getValue() != dewPower || DewHeaterNP.getState() == IPS_IDLE)
+        {
+            DewHeaterNP[0].setValue(dewPower);
+            DewHeaterNP.setState(IPS_OK);
+            DewHeaterNP.apply();
+        }
+        const bool autoDewOn = (autoDew != 0);
+        if (AutoDewSP[0].getState() != (autoDewOn ? ISS_ON : ISS_OFF) || AutoDewSP.getState() == IPS_IDLE)
+        {
+            AutoDewSP.reset();
+            AutoDewSP[autoDewOn ? 0 : 1].setState(ISS_ON);
+            AutoDewSP.setState(IPS_OK);
+            AutoDewSP.apply();
+        }
+        const uint8_t level = aggressivenessLevel(dewAggressive);
+        if (DewAggressivenessNP[0].getValue() != level || DewAggressivenessNP.getState() == IPS_IDLE)
+        {
+            DewAggressivenessNP[0].setValue(level);
+            DewAggressivenessNP.setState(IPS_OK);
+            DewAggressivenessNP.apply();
         }
     }
     catch (const std::exception &e)
@@ -884,19 +914,19 @@ bool PegasusFlatMasterNeo::setTemperatureOffset(double value)
     char cmd[16] = {0};
     char response[16] = {0};
     snprintf(cmd, 16, "CT:%.1f", value);
-    if (sendCommand(cmd, response))
-        return strstr(response, "CT:") != nullptr;
-    return false;
+    // The reply is not checked, as in the Pegasus software; the caller reads the offsets back with CR.
+    if (!sendCommand(cmd, response))
+        return false;
+    LOGF_DEBUG("CT reply: %s", response);
+    return true;
 }
 
 bool PegasusFlatMasterNeo::setHumidityOffset(double value)
 {
+    // The humidity offset is a whole percentage, -50..50.
     char cmd[16] = {0};
-    char response[16] = {0};
-    snprintf(cmd, 16, "CH:%.1f", value);
-    if (sendCommand(cmd, response))
-        return strstr(response, "CH:") != nullptr;
-    return false;
+    snprintf(cmd, 16, "CH:%d", static_cast<int>(std::lround(value)));
+    return sendEchoCommand(cmd);
 }
 
 bool PegasusFlatMasterNeo::getWeatherData()
@@ -924,8 +954,17 @@ bool PegasusFlatMasterNeo::getWeatherData()
 
     try
     {
-        setParameterValue("WEATHER_TEMPERATURE", std::stod(result[WI_TEMPERATURE]));
-        setParameterValue("WEATHER_HUMIDITY", std::stod(result[WI_HUMIDITY]));
+        // The device reports nan or -127 without a sensor; do not pass that on as a temperature.
+        const double temperature = std::stod(result[WI_TEMPERATURE]);
+        if (std::isnan(temperature) || temperature <= -127 || temperature > 80)
+        {
+            if (lastWeatherData.empty())
+                LOG_WARN("No temperature/humidity sensor data available.");
+            lastWeatherData = result;
+            return false;
+        }
+        setParameterValue("WEATHER_TEMPERATURE", temperature);
+        setParameterValue("WEATHER_HUMIDITY", std::fabs(std::stod(result[WI_HUMIDITY])));
         setParameterValue("WEATHER_DEWPOINT", std::stod(result[WI_DEWPOINT]));
     }
     catch (const std::exception &e)
@@ -989,11 +1028,8 @@ bool PegasusFlatMasterNeo::setThreshold(uint8_t value)
         return false;
     }
     char cmd[16] = {0};
-    char response[16] = {0};
     snprintf(cmd, sizeof(cmd), "DT:%d", value);
-    if (sendCommand(cmd, response))
-        return strstr(response, "DT:") != nullptr;
-    return false;
+    return sendEchoCommand(cmd);
 }
 
 // level 0..10 (logical) → DA:<level> (cache) + PD:<mapped_byte> (apply)
@@ -1001,20 +1037,13 @@ bool PegasusFlatMasterNeo::setThreshold(uint8_t value)
 bool PegasusFlatMasterNeo::setDewAggressiveness(uint8_t level)
 {
     char cmd[16] = {0};
-    char response[16] = {0};
-
     snprintf(cmd, sizeof(cmd), "DA:%d", level);
-    if (!sendCommand(cmd, response) || strstr(response, "DA:") == nullptr)
+    if (!sendEchoCommand(cmd))
         return false;
 
     const uint8_t mapped = static_cast<uint8_t>(9 + static_cast<int>(round(level * 246.0 / 10.0)));
-    char cmd2[16] = {0};
-    char response2[16] = {0};
-    snprintf(cmd2, sizeof(cmd2), "PD:%d", mapped);
-    if (!sendCommand(cmd2, response2) || strstr(response2, "PD:") == nullptr)
-        return false;
-
-    return true;
+    snprintf(cmd, sizeof(cmd), "PD:%d", mapped);
+    return sendEchoCommand(cmd);
 }
 
 bool PegasusFlatMasterNeo::saveDewLevels()
@@ -1046,7 +1075,7 @@ bool PegasusFlatMasterNeo::setWifiChannel(uint8_t channel)
     char response[16] = {0};
     snprintf(cmd, sizeof(cmd), "AC:%d", channel);
     if (sendCommand(cmd, response))
-        return atoi(response) != 0;
+        return isWifiReplyOk(response);
     return false;
 }
 
@@ -1056,7 +1085,7 @@ bool PegasusFlatMasterNeo::getAutoClose()
     if (!sendCommand("DC:99", response))
         return false;
 
-    const bool on = (strstr(response, "DC:1") != nullptr);
+    const bool on = (strcmp(response, "DC:1") == 0);
     AutoCloseSP.reset();
     AutoCloseSP[on ? 0 : 1].setState(ISS_ON);
     AutoCloseSP.setState(IPS_OK);
@@ -1067,11 +1096,8 @@ bool PegasusFlatMasterNeo::getAutoClose()
 bool PegasusFlatMasterNeo::setAutoClose(bool enable)
 {
     char cmd[16] = {0};
-    char response[16] = {0};
     snprintf(cmd, sizeof(cmd), "DC:%d", enable ? 1 : 0);
-    if (!sendCommand(cmd, response))
-        return false;
-    return strstr(response, enable ? "DC:1" : "DC:0") != nullptr;
+    return sendEchoCommand(cmd);
 }
 
 bool PegasusFlatMasterNeo::getHotspotStatus()
@@ -1121,12 +1147,18 @@ bool PegasusFlatMasterNeo::setHotspot(const char *ssid, const char *password)
     char response[16] = {0};
 
     snprintf(cmd, sizeof(cmd), "AN:%s", ssid);
-    if (!sendCommand(cmd, response) || strstr(response, "AN:") == nullptr)
+    if (!sendCommand(cmd, response) || !isWifiReplyOk(response))
+    {
+        LOGF_ERROR("Setting the hotspot SSID failed: '%s'", response);
         return false;
+    }
 
     snprintf(cmd, sizeof(cmd), "AP:%s", password);
-    if (!sendCommand(cmd, response) || strstr(response, "AP:") == nullptr)
+    if (!sendCommand(cmd, response) || !isWifiReplyOk(response))
+    {
+        LOGF_ERROR("Setting the hotspot password failed: '%s'", response);
         return false;
+    }
 
     return true;
 }
@@ -1152,7 +1184,7 @@ bool PegasusFlatMasterNeo::getCurrentWifi()
 
 bool PegasusFlatMasterNeo::scanWifiNetworks()
 {
-    char response[512] = {0};
+    char response[2048] = {0};
     // WS has up to 15 second scan timeout
     if (!sendCommand("WS", response, 16))
         return false;
@@ -1178,26 +1210,28 @@ bool PegasusFlatMasterNeo::connectToWifi(const char *ssid, const char *password)
     char cmd[NEO_LEN]  = {0};
     char response[16]  = {0};
 
-    snprintf(cmd, sizeof(cmd), "WN:%s", ssid);
-    if (!sendCommand(cmd, response) || strstr(response, "WN:") == nullptr)
-        return false;
-
     // Empty password: send "PASSWORD" placeholder; otherwise min 8 chars
-    if (!password || password[0] == '\0')
+    if (password && password[0] != '\0' && strlen(password) < 8)
     {
-        if (!sendCommand("WP:PASSWORD", response) || strstr(response, "WP:") == nullptr)
-            return false;
+        LOG_ERROR("WiFi password must be at least 8 characters.");
+        return false;
     }
-    else
+
+    snprintf(cmd, sizeof(cmd), "WN:%s", ssid);
+    if (!sendCommand(cmd, response) || !isWifiReplyOk(response))
     {
-        if (strlen(password) < 8)
-        {
-            LOG_ERROR("WiFi password must be at least 8 characters.");
-            return false;
-        }
+        LOGF_ERROR("Setting the WiFi SSID failed: '%s'", response);
+        return false;
+    }
+
+    if (!password || password[0] == '\0')
+        snprintf(cmd, sizeof(cmd), "WP:PASSWORD");
+    else
         snprintf(cmd, sizeof(cmd), "WP:%s", password);
-        if (!sendCommand(cmd, response) || strstr(response, "WP:") == nullptr)
-            return false;
+    if (!sendCommand(cmd, response) || !isWifiReplyOk(response))
+    {
+        LOG_ERROR("Setting the WiFi password failed.");
+        return false;
     }
 
     return true;
@@ -1205,11 +1239,9 @@ bool PegasusFlatMasterNeo::connectToWifi(const char *ssid, const char *password)
 
 bool PegasusFlatMasterNeo::wifiFactoryReset()
 {
-    char response[16] = {0};
     // WZ sends without waiting for a response (Channel.Write behavior)
-    tty_write(PortFD, "WZ\n", 3, nullptr);
-    (void)response;
-    return true;
+    int nbytes_written = 0;
+    return tty_write(PortFD, "WZ\n", 3, &nbytes_written) == TTY_OK;
 }
 
 std::vector<std::string> PegasusFlatMasterNeo::split(const std::string &input, const std::string &sep)
