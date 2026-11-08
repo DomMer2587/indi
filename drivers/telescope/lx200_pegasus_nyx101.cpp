@@ -101,13 +101,10 @@ bool LX200NYX101::initProperties()
     SafetyLimitSP[CLEAR_SAFETY_LIMIT].fill("CLEAR_SAFETY_LIMIT", "Clear", ISS_OFF);
     SafetyLimitSP.fill(getDeviceName(), "SAFETY_LIMIT",
                        "Custom Limits", MAIN_CONTROL_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
-    // Guide Rate
-    int guideRate = 1;
-    IUGetConfigOnSwitchIndex(getDeviceName(), "GUIDE_RATE", &guideRate);
-    GuideRateSP[0].fill("0.25", "0.25", guideRate == 0 ? ISS_ON : ISS_OFF);
-    GuideRateSP[1].fill("0.50", "0.50", guideRate == 1 ? ISS_ON : ISS_OFF);
-    GuideRateSP[2].fill("1.00", "1.00", guideRate == 2 ? ISS_ON : ISS_OFF);
-    GuideRateSP.fill(getDeviceName(), "GUIDE_RATE", "Guide Rate", SETTINGS_TAB, IP_RW, ISR_1OFMANY, 60, IPS_IDLE);
+    // Guide Rate: standard number property, so clients such as PHD2 can read it.
+    GuideRateNP[AXIS_RA].fill("GUIDE_RATE_WE", "W/E Rate", "%.2f", 0.25, 1.0, 0.25, 0.5);
+    GuideRateNP[AXIS_DE].fill("GUIDE_RATE_NS", "N/S Rate", "%.2f", 0.25, 1.0, 0.25, 0.5);
+    GuideRateNP.fill(getDeviceName(), "GUIDE_RATE", "Guide Rate", SETTINGS_TAB, IP_RW, 60, IPS_IDLE);
 
     //Go Home
     // HomeSP[0].fill("GO", "Go", ISS_OFF);
@@ -221,14 +218,9 @@ bool LX200NYX101::updateProperties()
 
         if(sendCommand(":GX90#", status))
         {
-            std::string c = status;
-
-            GuideRateSP.reset();
-            GuideRateSP[0].setState((c.find("0.25") != std::string::npos) ? ISS_ON : ISS_OFF);
-            GuideRateSP[1].setState((c.find("0.50") != std::string::npos) ? ISS_ON : ISS_OFF);
-            GuideRateSP[2].setState((c.find("1.00") != std::string::npos) ? ISS_ON : ISS_OFF);
-            GuideRateSP.setState((IPS_OK));
-            GuideRateSP.apply();
+            GuideRateNP[AXIS_RA].setValue(GUIDE_RATES[nearestGuideRate(std::strtod(status, nullptr))]);
+            GuideRateNP[AXIS_DE].setValue(GuideRateNP[AXIS_RA].getValue());
+            GuideRateNP.setState(IPS_OK);
         }
 
         if(sendCommand(":Go#", status))
@@ -249,7 +241,7 @@ bool LX200NYX101::updateProperties()
             MeridianLimitNP[0].setValue(std::stoi(c));
         }
 
-        defineProperty(GuideRateSP);
+        defineProperty(GuideRateNP);
         // defineProperty(HomeSP);
         // defineProperty(ResetHomeSP);
         defineProperty(Report);
@@ -281,7 +273,7 @@ bool LX200NYX101::updateProperties()
     }
     else
     {
-        deleteProperty(GuideRateSP);
+        deleteProperty(GuideRateNP);
         //deleteProperty(HomeSP);
         deleteProperty(MeridianLimitNP);
         deleteProperty(FlipSP);
@@ -614,6 +606,37 @@ bool LX200NYX101::ISNewNumber(const char *dev, const char *name, double values[]
             return true;
         }
 
+        if (GuideRateNP.isNameMatch(name))
+        {
+            // One rate for both axes: take the element the client changed.
+            double requested = values[0];
+            for (int i = 0; i < n; i++)
+            {
+                auto element = GuideRateNP.findWidgetByName(names[i]);
+                if (element && std::fabs(element->getValue() - values[i]) > 1e-6)
+                {
+                    requested = values[i];
+                    break;
+                }
+            }
+
+            const int index = nearestGuideRate(requested);
+            if (isConnected() && !setGuideRate(index))
+            {
+                GuideRateNP.setState(IPS_ALERT);
+                GuideRateNP.apply();
+                return true;
+            }
+
+            if (std::fabs(GUIDE_RATES[index] - requested) > 1e-6)
+                LOGF_INFO("NYX-101 supports guide rates 0.25, 0.50 and 1.00 only, using %.2f.", GUIDE_RATES[index]);
+            if (std::fabs(GUIDE_RATES[index] - GuideRateNP[AXIS_RA].getValue()) > 1e-6)
+                LOG_WARN("RA and DEC guide rate changed.");
+
+            setGuideRateValue(index);
+            return true;
+        }
+
         if (ElevationLimitNP.isNameMatch(name))
         {
             if(ElevationLimitNP.update(values, names, n))
@@ -644,23 +667,7 @@ bool LX200NYX101::ISNewSwitch(const char *dev, const char *name, ISState *states
 {
     if (dev != nullptr && strcmp(dev, getDeviceName()) == 0)
     {
-        if(GuideRateSP.isNameMatch(name))
-        {
-            int previousType = GuideRateSP.findOnSwitchIndex();
-            GuideRateSP.update(states, names, n);
-            IPState state = IPS_OK;
-            if (isConnected())
-            {
-                auto targetType = GuideRateSP.findOnSwitchIndex();
-                state = setGuideRate(targetType) ? IPS_OK : IPS_ALERT;
-                if (state == IPS_OK && previousType != targetType)
-                    LOG_WARN("RA and DEC guide rate changed.");
-            }
-            GuideRateSP.setState(state);
-            GuideRateSP.apply();
-            return true;
-        }
-        else if(FlipSP.isNameMatch(name))
+        if(FlipSP.isNameMatch(name))
         {
             FlipSP.update(states, names, n);
             IPState state = IPS_OK;
@@ -835,6 +842,23 @@ bool LX200NYX101::setGuideRate(int rate)
     char command[DRIVER_LEN] = {0};
     snprintf(command, DRIVER_LEN, ":R%d#", rate);
     return sendCommand(command);
+}
+
+int LX200NYX101::nearestGuideRate(double rate)
+{
+    int index = 0;
+    for (int i = 1; i < 3; i++)
+        if (std::fabs(GUIDE_RATES[i] - rate) < std::fabs(GUIDE_RATES[index] - rate))
+            index = i;
+    return index;
+}
+
+void LX200NYX101::setGuideRateValue(int index)
+{
+    GuideRateNP[AXIS_RA].setValue(GUIDE_RATES[index]);
+    GuideRateNP[AXIS_DE].setValue(GUIDE_RATES[index]);
+    GuideRateNP.setState(IPS_OK);
+    GuideRateNP.apply();
 }
 
 bool LX200NYX101::SetTrackMode(uint8_t mode)
