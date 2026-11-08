@@ -24,6 +24,8 @@
 #pragma once
 
 #include "lx200generic.h"
+
+#include <chrono>
 //#define DEBUG_NYX
 
 
@@ -62,6 +64,11 @@ class LX200NYX101 : public LX200Generic
         static constexpr const uint8_t DRIVER_LEN {64};
         static const char DRIVER_STOP_CHAR { 0x23 };
         static constexpr const uint8_t DRIVER_TIMEOUT {3};
+        // How long the mount may keep reporting parked after an unpark request.
+        static constexpr std::chrono::seconds UNPARK_TIMEOUT {10};
+
+        bool m_UnparkPending {false};
+        std::chrono::steady_clock::time_point m_UnparkRequested;
 
         enum RefractionState
         {

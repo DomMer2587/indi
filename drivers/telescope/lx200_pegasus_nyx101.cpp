@@ -388,7 +388,8 @@ bool LX200NYX101::ReadScopeStatus()
     SetPropertyText(SlewingHome, IPS_BUSY);
 
     char status[DRIVER_LEN] = {0};
-    if(sendCommand(":GU#", status))
+    const bool statusRead = sendCommand(":GU#", status);
+    if(statusRead)
     {
         Report[0].text = status;
         Report.apply();
@@ -516,7 +517,11 @@ bool LX200NYX101::ReadScopeStatus()
     }
 
 
-    if (TrackState == SCOPE_SLEWING)
+    if (!statusRead)
+    {
+        // Without a status the flags above are only defaults; keep the current state.
+    }
+    else if (TrackState == SCOPE_SLEWING)
     {
         if (_IsSlewCompleted)
         {
@@ -524,9 +529,27 @@ bool LX200NYX101::ReadScopeStatus()
             LOG_INFO("Slew is complete. Tracking...");
         }
     }
+    else if (m_UnparkPending)
+    {
+        // The mount may still report parked for a moment after an unpark request.
+        if (!_IsParked)
+            m_UnparkPending = false;
+        else if (std::chrono::steady_clock::now() - m_UnparkRequested > UNPARK_TIMEOUT)
+        {
+            m_UnparkPending = false;
+            LOG_WARN("Mount is still parked after the unpark request.");
+            SetParked(true);
+        }
+    }
     else if (TrackState != SCOPE_PARKED && _IsParked)
     {
         SetParked(true);
+    }
+    else if (TrackState == SCOPE_PARKED && !_IsParked)
+    {
+        // Unparked outside INDI, e.g. by the hand controller or app. Motion commands would be refused otherwise.
+        LOG_INFO("Mount reports unparked.");
+        SetParked(false);
     }
     else
     {
@@ -867,7 +890,10 @@ bool LX200NYX101::Park()
 {
     bool rc = goToPark();
     if (rc)
+    {
+        m_UnparkPending = false;
         TrackState = SCOPE_PARKING;
+    }
 
     return rc;
 }
@@ -876,7 +902,12 @@ bool LX200NYX101::UnPark()
 {
     bool rc = goToUnPark();
     if(rc)
+    {
+        // ReadScopeStatus() waits for the mount to confirm, instead of parking again on a stale 'P'.
+        m_UnparkRequested = std::chrono::steady_clock::now();
+        m_UnparkPending = true;
         SetParked(false);
+    }
 
     return rc;
 }
