@@ -207,6 +207,9 @@ class ScopeSim : public INDI::Telescope, public INDI::GuiderInterface,
         double m_snoopedAzError { 0 };
         double m_snoopedAltError { 0 };
 
+        // Simulation settings are loaded from the config on the first getProperties only.
+        bool m_simConfigLoaded { false };
+
 #endif
 
         // True pointing position (Wallace errors applied) published as EQUATORIAL_PE so the
