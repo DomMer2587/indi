@@ -119,6 +119,8 @@ bool Esatto::updateProperties()
         if (updateTemperature())
             defineProperty(TemperatureNP);
 
+        m_CalibrationStage = CALIBRATION_IDLE;
+        CalibrationSP.setState(IPS_IDLE);
         defineProperty(CalibrationSP);
     }
     else
@@ -150,23 +152,24 @@ bool Esatto::ISNewSwitch(const char *dev, const char *name, ISState *states, cha
             return true;
         }
 
-        // The web interface only calibrates with the focuser fully in, where its sensor is active
+        // The web interface only calibrates with the focuser fully in, where its sensor is active.
+        // Elsewhere move in to position 0 first, TimerHit() starts the calibration there.
         bool atSensor = false;
         if (FocusAbsPosNP.getState() == IPS_BUSY)
         {
             LOG_ERROR("Wait until the focuser stopped, then calibrate.");
             CalibrationSP.setState(IPS_ALERT);
         }
-        else if (!m_Esatto->isHallSensorDetected(atSensor) || !atSensor)
-        {
-            LOG_ERROR("Move the focuser fully in until its sensor is active, then calibrate.");
+        else if (!m_Esatto->isHallSensorDetected(atSensor))
             CalibrationSP.setState(IPS_ALERT);
-        }
-        else if (m_Esatto->calibrate())
+        else if (atSensor)
+            CalibrationSP.setState(startCalibration() ? IPS_BUSY : IPS_ALERT);
+        else if (m_Esatto->goAbsolutePosition(0))
         {
-            LOG_INFO("Calibrating the focuser. Please wait.");
+            LOG_INFO("Moving the focuser in to its sensor, the calibration starts there.");
             m_MoveStartPosition = FocusAbsPosNP[0].getValue();
             m_MoveTimer.start();
+            m_CalibrationStage = CALIBRATION_MOVING_IN;
             CalibrationSP.setState(IPS_BUSY);
             FocusAbsPosNP.setState(IPS_BUSY);
             FocusAbsPosNP.apply();
@@ -304,11 +307,33 @@ bool Esatto::AbortFocuser()
 
     if (CalibrationSP.getState() == IPS_BUSY)
     {
+        m_CalibrationStage = CALIBRATION_IDLE;
         CalibrationSP.setState(IPS_IDLE);
         CalibrationSP.apply();
     }
 
     return m_Esatto->stop();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+///
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+bool Esatto::startCalibration()
+{
+    if (!m_Esatto->calibrate())
+    {
+        LOG_ERROR("Failed to start the calibration.");
+        m_CalibrationStage = CALIBRATION_IDLE;
+        return false;
+    }
+
+    LOG_INFO("Calibrating the focuser. Please wait.");
+    m_MoveStartPosition = FocusAbsPosNP[0].getValue();
+    m_MoveTimer.start();
+    m_CalibrationStage = CALIBRATION_RUNNING;
+    FocusAbsPosNP.setState(IPS_BUSY);
+    FocusAbsPosNP.apply();
+    return true;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -336,15 +361,35 @@ void Esatto::TimerHit()
             // To prevent reporting a bit too old position as the final one
             updatePosition();
 
-            FocusAbsPosNP.setState(IPS_OK);
-            FocusRelPosNP.setState(IPS_OK);
-            FocusRelPosNP.apply();
-
-            if (CalibrationSP.getState() == IPS_BUSY)
+            bool calibrationStarted = false;
+            if (m_CalibrationStage == CALIBRATION_MOVING_IN)
             {
+                bool atSensor = false;
+                if (m_Esatto->isHallSensorDetected(atSensor) && atSensor)
+                    calibrationStarted = startCalibration();
+                else
+                    LOG_ERROR("The sensor is not active at position 0. Move the focuser in by hand, then calibrate.");
+
+                if (!calibrationStarted)
+                {
+                    m_CalibrationStage = CALIBRATION_IDLE;
+                    CalibrationSP.setState(IPS_ALERT);
+                    CalibrationSP.apply();
+                }
+            }
+            else if (m_CalibrationStage == CALIBRATION_RUNNING)
+            {
+                m_CalibrationStage = CALIBRATION_IDLE;
                 CalibrationSP.setState(IPS_OK);
                 CalibrationSP.apply();
                 LOG_INFO("Focuser calibration complete.");
+            }
+
+            if (!calibrationStarted)
+            {
+                FocusAbsPosNP.setState(IPS_OK);
+                FocusRelPosNP.setState(IPS_OK);
+                FocusRelPosNP.apply();
             }
         }
 
@@ -393,7 +438,7 @@ bool Esatto::isMoveFinished()
         return false;
 
     // The position stays put during the calibration, CAL_STATUS tells when it is done
-    if (CalibrationSP.getState() == IPS_BUSY)
+    if (m_CalibrationStage == CALIBRATION_RUNNING)
         return m_MoveTimer.elapsed() >= MOVE_START_GRACE_MS && !m_Esatto->isCalibrating();
 
     return FocusAbsPosNP[0].getValue() != m_MoveStartPosition || m_MoveTimer.elapsed() >= MOVE_START_GRACE_MS;

@@ -148,6 +148,10 @@ class EsattoArco : public INDI::Focuser, public INDI::RotatorInterface
         RotCalibrationStage rcStage { RotCalIdle };
 
         INDI::PropertySwitch FocusCalibrationSP {1};
+        // A calibration away from the sensor first moves in to position 0
+        enum FocusCalibrationStage { CALIBRATION_IDLE, CALIBRATION_MOVING_IN, CALIBRATION_RUNNING };
+        FocusCalibrationStage m_FocusCalibrationStage { CALIBRATION_IDLE };
+        bool startFocusCalibration();
         INDI::PropertySwitch RotatorCalibrationSP {1};
         // ISwitchVectorProperty RotatorCalibrationSP;
         enum

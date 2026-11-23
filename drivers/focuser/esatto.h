@@ -70,6 +70,10 @@ class Esatto : public INDI::Focuser
         double m_LastVoltage[2] = {-1, -1};
 
         INDI::PropertySwitch CalibrationSP {1};
+        // A calibration away from the sensor first moves in to position 0
+        enum CalibrationStage { CALIBRATION_IDLE, CALIBRATION_MOVING_IN, CALIBRATION_RUNNING };
+        CalibrationStage m_CalibrationStage { CALIBRATION_IDLE };
+        bool startCalibration();
 
         INDI::PropertyNumber TemperatureNP {2};
         enum
