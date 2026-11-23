@@ -12,7 +12,9 @@
       motor speed during a move, warnings at connect.
     - A motor still braking (BUSY 0, MST "dec") is busy.
     - Esatto Arco: the final position of a move, a rotator stop short of the target, the end of the Arco calibration.
-    - The focuser calibration only starts at the sensor, blocks moves and a second start, and ends with CAL_STATUS.
+    - The focuser calibration starts at the sensor, or moves in to position 0 first and starts there. Without the
+      sensor at 0 it ends with an error. An abort or a reconnection ends the move-in. It blocks moves and a second
+      start, and ends with CAL_STATUS.
 
     The drivers talk to a fake device on a pseudo terminal. Requests and replies are JSON objects ({"req": ...} and
     {"res": ...}, replies end with CR LF). The replies have the shape the driver's parser expects, as in an earlier
@@ -28,7 +30,9 @@
     - Assumed: the error reply to a refused command ({"ERROR": ...}), temperatures and voltages as strings, EXT_T
       "-127.0" without the external probe (the value the driver checks for), the backlash 120, CAL_MAXPOS 406929, the
       Arco limits of +-648000 steps (one arc second per step), the serial numbers, STATUS with only BUSY and MST, and
-      a pause with MST "stop" between two calibration phases. Each test sets when the positions change.
+      a pause with MST "stop" between two calibration phases, HSENDET 1 once the move-in has reached position 0
+      (HSENDET 0 there to stand for a zero position that is off), CAL_STATUS naming the phase from the calibration
+      request on. Each test sets when the positions change.
 
     SPDX-License-Identifier: LGPL-2.1-or-later
 */
@@ -450,6 +454,16 @@ class UnderTest : public Driver
             return sendSwitch("FOCUS_CALIBRATION", {{"CALIBRATION_START", ISS_ON}});
         }
 
+        bool abort()
+        {
+            return sendSwitch("FOCUS_ABORT_MOTION", {{"ABORT", ISS_ON}});
+        }
+
+        bool disconnect()
+        {
+            return sendSwitch("CONNECTION", {{"CONNECT", ISS_OFF}, {"DISCONNECT", ISS_ON}}) && !this->isConnected();
+        }
+
         // State of a property as the driver holds it.
         IPState numberState(const char *property)
         {
@@ -662,6 +676,184 @@ void pause(int milliseconds)
     std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
 }
 
+// Polls until the focuser calibration is no longer busy, at most 5 s. The driver waits 2 s after the calibration
+// request before it takes CAL_STATUS "stop" as its end.
+template <class Driver>
+void pollWhileCalibrating(Driver &driver)
+{
+    const auto start = std::chrono::steady_clock::now();
+    while (driver.switchState("FOCUS_CALIBRATION") == IPS_BUSY &&
+            std::chrono::steady_clock::now() - start < std::chrono::seconds(5))
+    {
+        driver.poll();
+        pause(100);
+    }
+}
+
+// The motor stops at position 0 with its sensor active (assumed: HSENDET 1 there, as at the inner end).
+void stopAtSensor(FakePrimaLuce &device)
+{
+    device.set("MOT1", "ABS_POS_STEP", 0);
+    device.set("MOT1", "HSENDET", 1);
+    device.set("MOT1", "STATUS", FakePrimaLuce::stopped());
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Focuser calibration away from the sensor, the same in both drivers. The focuser starts at 10000 with HSENDET 0.
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// The calibration first moves in to position 0 and starts there once the motor has stopped with the sensor active.
+// Then it ends with CAL_STATUS like one started at the sensor.
+template <class Driver>
+void checkCalibrationMovesInFirst(Driver &driver, FakePrimaLuce &device)
+{
+    device.takeWrites();
+
+    Published movingIn;
+    driver.startCalibration();
+    std::vector<json> started = device.takeWrites();
+    const IPState stateAfterStart = driver.switchState("FOCUS_CALIBRATION");
+    device.set("MOT1", "ABS_POS_STEP", 5000);
+    device.set("MOT1", "STATUS", FakePrimaLuce::moving());
+    driver.poll();
+    std::vector<json> whileMoving = device.takeWrites();
+    stopAtSensor(device);
+    driver.poll();
+    std::vector<json> atSensor = device.takeWrites();
+    std::vector<std::string> statesUntilSensor = movingIn.states("FOCUS_CALIBRATION");
+
+    Published done;
+    device.set("MOT1", "CAL_STATUS", "stop");
+    device.set("MOT1", "ABS_POS_STEP", 816);
+    pollWhileCalibrating(driver);
+    std::vector<std::string> calibrationStates = done.states("FOCUS_CALIBRATION");
+    std::vector<std::string> positionStates = done.states("ABS_FOCUS_POSITION");
+    std::vector<double> positions = done.values("ABS_FOCUS_POSITION", "FOCUS_ABSOLUTE_POSITION");
+    std::vector<std::string> messages = done.messages();
+
+    EXPECT_EQ(writesTo(started, "cmd", "MOT1", "MOVE_ABS"), std::vector<json> {json({{"STEP", 0}})})
+            << "The focuser did not move in to position 0";
+    EXPECT_TRUE(writesTo(started, "set", "MOT1", "CAL_STATUS").empty())
+            << "The calibration was started away from the sensor";
+    EXPECT_EQ(stateAfterStart, IPS_BUSY);
+    EXPECT_TRUE(whileMoving.empty()) << "Something was sent while the motor was moving in";
+    EXPECT_EQ(writesTo(atSensor, "set", "MOT1", "CAL_STATUS"), std::vector<json> {CALIBRATION_PHASE})
+            << "The calibration was not started at the sensor";
+    EXPECT_EQ(atSensor.size(), 1u);
+    ASSERT_FALSE(statesUntilSensor.empty());
+    EXPECT_EQ(statesUntilSensor.back(), "Busy");
+    EXPECT_FALSE(contains(statesUntilSensor, "Ok")) << "The calibration ended with the move-in";
+    ASSERT_FALSE(calibrationStates.empty());
+    EXPECT_EQ(calibrationStates.back(), "Ok") << "The calibration did not end with CAL_STATUS \"stop\"";
+    EXPECT_TRUE(anyContains(messages, "Focuser calibration complete.")) << "The end of the calibration was not logged";
+    ASSERT_FALSE(positionStates.empty());
+    EXPECT_EQ(positionStates.back(), "Ok");
+    ASSERT_FALSE(positions.empty());
+    EXPECT_EQ(positions.back(), 816);
+}
+
+// Without the sensor at position 0 the calibration is not started: it ends with an error that asks to move in by hand.
+template <class Driver>
+void checkCalibrationStopsWithoutSensor(Driver &driver, FakePrimaLuce &device)
+{
+    device.takeWrites();
+
+    Published published;
+    driver.startCalibration();
+    device.set("MOT1", "ABS_POS_STEP", 0);
+    driver.poll();
+    driver.poll();
+    std::vector<json> writes = device.takeWrites();
+    std::vector<std::string> calibrationStates = published.states("FOCUS_CALIBRATION");
+    std::vector<std::string> positionStates = published.states("ABS_FOCUS_POSITION");
+    std::vector<std::string> messages = published.messages();
+
+    EXPECT_EQ(writesTo(writes, "cmd", "MOT1", "MOVE_ABS"), std::vector<json> {json({{"STEP", 0}})})
+            << "The focuser did not move in to position 0";
+    EXPECT_TRUE(writesTo(writes, "set", "MOT1", "CAL_STATUS").empty())
+            << "The calibration was started without the sensor";
+    EXPECT_EQ(driver.switchState("FOCUS_CALIBRATION"), IPS_ALERT);
+    ASSERT_FALSE(calibrationStates.empty());
+    EXPECT_EQ(calibrationStates.back(), "Alert");
+    EXPECT_TRUE(anyContains(messages, "Move the focuser in by hand")) << "No error about the missing sensor";
+    ASSERT_FALSE(positionStates.empty());
+    EXPECT_EQ(positionStates.back(), "Ok") << "The move-in did not end";
+}
+
+// An abort during the move-in stops the motor and ends the calibration: a later move that reaches the sensor does
+// not start it.
+template <class Driver>
+void checkAbortEndsMoveIn(Driver &driver, FakePrimaLuce &device)
+{
+    device.takeWrites();
+
+    Published published;
+    driver.startCalibration();
+    std::vector<json> started = device.takeWrites();
+    device.set("MOT1", "ABS_POS_STEP", 5000);
+    device.set("MOT1", "STATUS", FakePrimaLuce::moving());
+    driver.poll();
+    driver.abort();
+    std::vector<json> aborted = device.takeWrites();
+    const IPState stateAfterAbort = driver.switchState("FOCUS_CALIBRATION");
+    device.set("MOT1", "STATUS", FakePrimaLuce::stopped());
+    driver.poll();
+    driver.poll();
+    std::vector<json> afterAbort = device.takeWrites();
+    driver.moveTo(0);
+    stopAtSensor(device);
+    driver.poll();
+    driver.poll();
+    std::vector<json> afterMove = device.takeWrites();
+    std::vector<std::string> calibrationStates = published.states("FOCUS_CALIBRATION");
+    std::vector<std::string> positionStates = published.states("ABS_FOCUS_POSITION");
+
+    EXPECT_EQ(writesTo(started, "cmd", "MOT1", "MOVE_ABS"), std::vector<json> {json({{"STEP", 0}})})
+            << "The focuser did not move in to position 0";
+    EXPECT_EQ(writesTo(aborted, "cmd", "MOT1", "MOT_STOP").size(), 1u) << "The motor was not stopped";
+    EXPECT_EQ(stateAfterAbort, IPS_IDLE);
+    EXPECT_TRUE(afterAbort.empty()) << "Something was sent after the abort";
+    EXPECT_EQ(writesTo(afterMove, "cmd", "MOT1", "MOVE_ABS"), std::vector<json> {json({{"STEP", 0}})});
+    EXPECT_TRUE(writesTo(afterMove, "set", "MOT1", "CAL_STATUS").empty()) << "The aborted calibration was started";
+    EXPECT_EQ(driver.switchState("FOCUS_CALIBRATION"), IPS_IDLE);
+    EXPECT_FALSE(contains(calibrationStates, "Ok"));
+    ASSERT_FALSE(positionStates.empty());
+    EXPECT_EQ(positionStates.back(), "Ok");
+}
+
+// A reconnection during the move-in ends the calibration: it is idle again, and a later move that reaches the sensor
+// does not start it.
+template <class Driver>
+void checkReconnectEndsMoveIn(Driver &driver, FakePrimaLuce &device)
+{
+    device.takeWrites();
+    driver.startCalibration();
+    std::vector<json> started = device.takeWrites();
+    ASSERT_TRUE(driver.disconnect());
+
+    Published published;
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+    const IPState stateAfterReconnect = driver.switchState("FOCUS_CALIBRATION");
+    device.takeWrites();
+    driver.moveTo(0);
+    stopAtSensor(device);
+    driver.poll();
+    driver.poll();
+    std::vector<json> afterMove = device.takeWrites();
+    std::vector<std::string> calibrationStates = published.states("FOCUS_CALIBRATION");
+
+    EXPECT_EQ(writesTo(started, "cmd", "MOT1", "MOVE_ABS"), std::vector<json> {json({{"STEP", 0}})})
+            << "The focuser did not move in to position 0";
+    EXPECT_EQ(stateAfterReconnect, IPS_IDLE) << "The calibration was still busy after the reconnection";
+    ASSERT_FALSE(calibrationStates.empty());
+    EXPECT_EQ(calibrationStates.front(), "Idle");
+    EXPECT_EQ(writesTo(afterMove, "cmd", "MOT1", "MOVE_ABS"), std::vector<json> {json({{"STEP", 0}})})
+            << "The move after the reconnection was refused";
+    EXPECT_TRUE(writesTo(afterMove, "set", "MOT1", "CAL_STATUS").empty())
+            << "The move-in from before the reconnection started the calibration";
+    EXPECT_FALSE(contains(calibrationStates, "Busy"));
+}
+
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -825,27 +1017,55 @@ TEST(EsattoTest, brakingMotorIsBusy)
     EXPECT_EQ(positions.back(), 20000);
 }
 
-// Like the web interface, the calibration is only started with the focuser on its sensor (HSENDET 1).
-TEST(EsattoTest, calibrationNeedsTheSensor)
+// Like the web interface, the calibration runs from the sensor (HSENDET 1). Away from it the focuser moves in to
+// position 0 first, the calibration starts there.
+TEST(EsattoTest, calibrationMovesInToTheSensorFirst)
 {
     FakePrimaLuce device;
     ASSERT_FALSE(device.portName().empty());
     EsattoUnderTest driver(ESATTO_NAME);
     ASSERT_TRUE(driver.connectTo(device.portName()));
-    device.takeWrites();
 
-    Published published;
-    driver.startCalibration();
-    std::vector<std::string> states = published.states("FOCUS_CALIBRATION");
-    std::vector<json> calibrations = writesTo(device.takeWrites(), "set", "MOT1", "CAL_STATUS");
-
-    EXPECT_TRUE(calibrations.empty()) << "The calibration was started away from the sensor";
-    EXPECT_FALSE(contains(states, "Ok"));
+    checkCalibrationMovesInFirst(driver, device);
 }
 
-// At the sensor the calibration starts with CAL_STATUS. While it runs the positions stay put and the Esatto reports
-// the name of the phase in CAL_STATUS: a move and a second start are refused (a move shifted the zero position), and
-// the calibration only ends once CAL_STATUS is "stop" again, also after the 2 s the driver allows a move to start.
+// A zero position that is off: no sensor at 0, no calibration.
+TEST(EsattoTest, calibrationStopsWithoutSensorAtZero)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    EsattoUnderTest driver(ESATTO_NAME);
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+
+    checkCalibrationStopsWithoutSensor(driver, device);
+}
+
+// An abort during the move-in ends the calibration.
+TEST(EsattoTest, abortEndsTheMoveIn)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    EsattoUnderTest driver(ESATTO_NAME);
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+
+    checkAbortEndsMoveIn(driver, device);
+}
+
+// A reconnection during the move-in ends the calibration.
+TEST(EsattoTest, reconnectEndsTheMoveIn)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    EsattoUnderTest driver(ESATTO_NAME);
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+
+    checkReconnectEndsMoveIn(driver, device);
+}
+
+// At the sensor the calibration starts with CAL_STATUS, without a move. While it runs the positions stay put and the
+// Esatto reports the name of the phase in CAL_STATUS: a move and a second start are refused (a move shifted the zero
+// position), and the calibration only ends once CAL_STATUS is "stop" again, also after the 2 s the driver allows a
+// move to start.
 TEST(EsattoTest, calibrationRunsUntilCalStatusStops)
 {
     FakePrimaLuce device;
@@ -880,6 +1100,8 @@ TEST(EsattoTest, calibrationRunsUntilCalStatusStops)
     std::vector<double> positions = done.values("ABS_FOCUS_POSITION", "FOCUS_ABSOLUTE_POSITION");
 
     EXPECT_EQ(writesTo(started, "set", "MOT1", "CAL_STATUS"), std::vector<json> {CALIBRATION_PHASE});
+    EXPECT_TRUE(writesTo(started, "cmd", "MOT1", "MOVE_ABS").empty())
+            << "The focuser moved although it is at the sensor";
     EXPECT_EQ(started.size(), 1u);
     EXPECT_TRUE(writesTo(refused, "cmd", "MOT1", "MOVE_ABS").empty()) << "A move was sent during the calibration";
     EXPECT_TRUE(writesTo(refused, "set", "MOT1", "CAL_STATUS").empty()) << "The calibration was started twice";
@@ -1255,26 +1477,55 @@ TEST(EsattoArcoTest, arcoCalibrationEndsWithCalStatus)
     EXPECT_NE(driver.switchState("ARCO_CALIBRATION"), IPS_BUSY);
 }
 
-// The focuser calibration of the Esatto Arco driver also needs the sensor.
-TEST(EsattoArcoTest, focusCalibrationNeedsTheSensor)
+// Same as for the Esatto: away from the sensor the focuser moves in to position 0 first.
+TEST(EsattoArcoTest, focusCalibrationMovesInToTheSensorFirst)
 {
     FakePrimaLuce device;
     ASSERT_FALSE(device.portName().empty());
     auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
     ArcoUnderTest &driver = *arco;
     ASSERT_TRUE(driver.connectTo(device.portName()));
-    device.takeWrites();
 
-    Published published;
-    driver.startCalibration();
-    std::vector<std::string> states = published.states("FOCUS_CALIBRATION");
-    std::vector<json> calibrations = writesTo(device.takeWrites(), "set", "MOT1", "CAL_STATUS");
-
-    EXPECT_TRUE(calibrations.empty()) << "The calibration was started away from the sensor";
-    EXPECT_FALSE(contains(states, "Ok"));
+    checkCalibrationMovesInFirst(driver, device);
 }
 
-// At the sensor it starts with CAL_STATUS, and a move during the calibration is refused.
+// Same as for the Esatto: no sensor at 0, no calibration.
+TEST(EsattoArcoTest, focusCalibrationStopsWithoutSensorAtZero)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
+    ArcoUnderTest &driver = *arco;
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+
+    checkCalibrationStopsWithoutSensor(driver, device);
+}
+
+// Same as for the Esatto: an abort during the move-in ends the calibration.
+TEST(EsattoArcoTest, abortEndsTheFocusMoveIn)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
+    ArcoUnderTest &driver = *arco;
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+
+    checkAbortEndsMoveIn(driver, device);
+}
+
+// Same as for the Esatto: a reconnection during the move-in ends the calibration.
+TEST(EsattoArcoTest, reconnectEndsTheFocusMoveIn)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
+    ArcoUnderTest &driver = *arco;
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+
+    checkReconnectEndsMoveIn(driver, device);
+}
+
+// At the sensor it starts with CAL_STATUS without a move, and a move during the calibration is refused.
 TEST(EsattoArcoTest, focusCalibrationBlocksMoves)
 {
     FakePrimaLuce device;
@@ -1295,6 +1546,8 @@ TEST(EsattoArcoTest, focusCalibrationBlocksMoves)
     std::vector<std::string> states = published.states("FOCUS_CALIBRATION");
 
     EXPECT_EQ(writesTo(started, "set", "MOT1", "CAL_STATUS"), std::vector<json> {CALIBRATION_PHASE});
+    EXPECT_TRUE(writesTo(started, "cmd", "MOT1", "MOVE_ABS").empty())
+            << "The focuser moved although it is at the sensor";
     EXPECT_EQ(started.size(), 1u);
     EXPECT_TRUE(writesTo(refused, "cmd", "MOT1", "MOVE_ABS").empty()) << "A move was sent during the calibration";
     EXPECT_TRUE(writesTo(refused, "set", "MOT1", "CAL_STATUS").empty()) << "The calibration was started twice";
@@ -1323,9 +1576,9 @@ int main(int argc, char **argv)
     setenv("HOME", dir.c_str(), 1);
     setenv("INDICONFIG", (dir + "/config.xml").c_str(), 1);
 
-    // Warnings reach the client as messages, some tests check them.
-    INDI::Logger::getInstance().configure("", INDI::Logger::file_off,
-                                          INDI::Logger::DBG_ERROR, INDI::Logger::DBG_ERROR | INDI::Logger::DBG_WARNING);
+    // Errors, warnings and session messages reach the client as messages, some tests check them.
+    const int screenLevels = INDI::Logger::DBG_ERROR | INDI::Logger::DBG_WARNING | INDI::Logger::DBG_SESSION;
+    INDI::Logger::getInstance().configure("", INDI::Logger::file_off, INDI::Logger::DBG_ERROR, screenLevels);
     // The death tests run in a fresh process, not in a fork of one that already ran fake devices.
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     ::testing::InitGoogleTest(&argc, argv);
