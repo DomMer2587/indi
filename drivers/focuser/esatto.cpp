@@ -33,7 +33,7 @@ static const char *ENVIRONMENT_TAB  = "Environment";
 
 Esatto::Esatto()
 {
-    setVersion(1, 1);
+    setVersion(1, 2);
 
     // Can move in Absolute & Relative motions, can AbortFocuser motion.
     FI::SetCapability(FOCUSER_CAN_ABS_MOVE | FOCUSER_HAS_BACKLASH | FOCUSER_CAN_REL_MOVE | FOCUSER_CAN_ABORT);
@@ -158,7 +158,9 @@ bool Esatto::ISNewSwitch(const char *dev, const char *name, ISState *states, cha
             return true;
         }
 
-        // The web interface only calibrates with the focuser fully in, where its sensor is active
+        // Like the web interface: at the active sensor with the focuser fully in, or away from the sensor with
+        // "exec", which on an LP moves in to the sensor first. Away from the sensor the other models calibrate
+        // the whole travel, which was never tried, so they still have to be moved in by hand.
         bool atSensor = false;
         if (FocusAbsPosNP.getState() == IPS_BUSY)
         {
@@ -170,14 +172,15 @@ bool Esatto::ISNewSwitch(const char *dev, const char *name, ISState *states, cha
             LOG_ERROR("The focuser reports a running calibration. Wait until it is done.");
             CalibrationSP.setState(IPS_ALERT);
         }
-        else if (!m_Esatto->isHallSensorDetected(atSensor) || !atSensor)
+        else if (!m_Esatto->isHallSensorDetected(atSensor) || (!atSensor && !m_Esatto->isLowProfile()))
         {
             LOG_ERROR("Move the focuser fully in until its sensor is active, then calibrate.");
             CalibrationSP.setState(IPS_ALERT);
         }
         // The web interface asks whether the focuser is in or out when its sensor is active and sends another
         // request for a focuser fully out. Only the one for a focuser fully in has been seen on a device.
-        else if (FocusMaxPosNP[0].getValue() > 0 && FocusAbsPosNP[0].getValue() > FocusMaxPosNP[0].getValue() / 2)
+        else if (atSensor && FocusMaxPosNP[0].getValue() > 0 &&
+                 FocusAbsPosNP[0].getValue() > FocusMaxPosNP[0].getValue() / 2)
         {
             LOG_ERROR("The focuser is not fully in. Move it fully in until its sensor is active, then calibrate.");
             CalibrationSP.setState(IPS_ALERT);
@@ -185,9 +188,10 @@ bool Esatto::ISNewSwitch(const char *dev, const char *name, ISState *states, cha
         else
         {
             m_CalibrationCountKnown = m_Esatto->getCalibrationCount(m_CalibrationCount);
-            if (m_Esatto->calibrate())
+            if (atSensor ? m_Esatto->calibrate() : m_Esatto->calibrateToSensor())
             {
-                LOG_INFO("Calibrating the focuser. Please wait.");
+                LOG_INFO(atSensor ? "Calibrating the focuser. Please wait." :
+                         "The focuser moves in to its sensor and calibrates there. Please wait.");
                 m_MoveStartPosition = FocusAbsPosNP[0].getValue();
                 m_MoveTimer.start();
                 CalibrationSP.setState(IPS_BUSY);

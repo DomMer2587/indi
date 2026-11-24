@@ -830,6 +830,17 @@ bool Esatto::calibrate()
     return m_Communication->set(MOT_1, {{"CAL_STATUS", "ManageCalibInMinPosWithSensorAct"}});
 }
 
+bool Esatto::calibrateToSensor()
+{
+    return m_Communication->set(MOT_1, {{"CAL_STATUS", "exec"}});
+}
+
+bool Esatto::isLowProfile()
+{
+    std::string model;
+    return getModel(model) && model.find("LP") != std::string::npos;
+}
+
 bool Esatto::isCalibrating()
 {
     std::string value;
