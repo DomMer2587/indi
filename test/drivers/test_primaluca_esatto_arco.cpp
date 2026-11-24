@@ -16,6 +16,7 @@
       It is complete only if CAL_NUMOF rose; an abort ends it in Alert, and moves wait until the firmware reports
       CAL_STATUS "stop", also for a calibration started elsewhere. After an aborted or incomplete calibration moves
       wait until a calibration has completed (CAL_NUMOF rose). A move to the current position sends nothing.
+      Away from the sensor an LP is calibrated with "exec", other models are refused.
 
     The drivers talk to a fake device on a pseudo terminal. Requests and replies are JSON objects ({"req": ...} and
     {"res": ...}, replies end with CR LF). The replies have the shape the driver's parser expects, as in an earlier
@@ -866,6 +867,64 @@ void checkMoveToCurrentPositionSendsNothing(Driver &driver, FakePrimaLuce &devic
     EXPECT_EQ(states.back(), "Ok");
 }
 
+// Away from the sensor an LP is calibrated with CAL_STATUS "exec", as the web interface does: the firmware moves in to
+// the sensor itself (seen on an ESATTO 2" LP from 30000 and 203000: about 4 s and 22 s, then "stop" and a higher
+// CAL_NUMOF). The driver sends no move of its own.
+template <class Driver>
+void checkLowProfileCalibratesWithExec(Driver &driver, FakePrimaLuce &device, bool completes)
+{
+    device.takeWrites();
+
+    Published published;
+    driver.startCalibration();
+    std::vector<json> started = device.takeWrites();
+    const IPState stateAfterStart = driver.switchState("FOCUS_CALIBRATION");
+    driver.poll();
+    device.set("MOT1", "CAL_STATUS", "stop");
+    if (completes)
+        device.set("MOT1", "CAL_NUMOF", 18);
+    pollPastStartGrace(driver);
+    std::vector<std::string> states = published.states("FOCUS_CALIBRATION");
+    std::vector<std::string> messages = published.messages();
+
+    EXPECT_EQ(writesTo(started, "set", "MOT1", "CAL_STATUS"), std::vector<json> {"exec"})
+            << "An LP away from its sensor was not calibrated with \"exec\"";
+    EXPECT_TRUE(writesTo(started, "cmd", "MOT1", "MOVE_ABS").empty()) << "The driver moved the focuser itself";
+    EXPECT_EQ(stateAfterStart, IPS_BUSY);
+    EXPECT_TRUE(anyContains(messages, "moves in to its sensor"));
+    ASSERT_FALSE(states.empty());
+    EXPECT_EQ(states.back(), completes ? "Ok" : "Alert");
+}
+
+// The other models calibrate their whole travel with "exec", which was never tried: away from the sensor they are
+// still refused.
+template <class Driver>
+void checkOtherModelAwayFromSensorIsRefused(Driver &driver, FakePrimaLuce &device)
+{
+    device.takeWrites();
+
+    Published published;
+    driver.startCalibration();
+    std::vector<json> writes = device.takeWrites();
+    std::vector<std::string> messages = published.messages();
+
+    EXPECT_TRUE(writesTo(writes, "set", "MOT1", "CAL_STATUS").empty()) << "A calibration was started away from the sensor";
+    EXPECT_TRUE(writesTo(writes, "cmd", "MOT1", "MOVE_ABS").empty());
+    EXPECT_EQ(driver.switchState("FOCUS_CALIBRATION"), IPS_ALERT);
+    EXPECT_TRUE(anyContains(messages, "Move the focuser fully in"));
+}
+
+// At the sensor an LP is still calibrated with the request for a focuser fully in, not with "exec".
+template <class Driver>
+void checkLowProfileAtSensorUsesMinPos(Driver &driver, FakePrimaLuce &device)
+{
+    device.takeWrites();
+    driver.startCalibration();
+    std::vector<json> started = device.takeWrites();
+
+    EXPECT_EQ(writesTo(started, "set", "MOT1", "CAL_STATUS"), std::vector<json> {CALIBRATION_PHASE});
+}
+
 // A calibration the driver did not start (web interface, hand pad, or still running after an abort before a
 // reconnect) also refuses moves and a new start.
 template <class Driver>
@@ -1187,6 +1246,49 @@ TEST(EsattoTest, moveToCurrentPositionSendsNothing)
     EsattoUnderTest driver(ESATTO_NAME);
     ASSERT_TRUE(driver.connectTo(device.portName()));
     checkMoveToCurrentPositionSendsNothing(driver, device);
+}
+
+TEST(EsattoTest, lowProfileCalibratesWithExec)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    device.set("", "MODNAME", "ESATTO2LP");
+    device.set("MOT1", "ABS_POS_STEP", 203000);
+    EsattoUnderTest driver(ESATTO_NAME);
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+    checkLowProfileCalibratesWithExec(driver, device, true);
+}
+
+TEST(EsattoTest, lowProfileExecWithoutCountIsAlert)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    device.set("", "MODNAME", "ESATTO2LP");
+    device.set("MOT1", "ABS_POS_STEP", 123569);
+    EsattoUnderTest driver(ESATTO_NAME);
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+    checkLowProfileCalibratesWithExec(driver, device, false);
+}
+
+TEST(EsattoTest, otherModelAwayFromSensorIsRefused)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    device.set("", "MODNAME", "ESATTO2");
+    EsattoUnderTest driver(ESATTO_NAME);
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+    checkOtherModelAwayFromSensorIsRefused(driver, device);
+}
+
+TEST(EsattoTest, lowProfileAtSensorUsesMinPos)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    device.set("", "MODNAME", "ESATTO2LP");
+    device.set("MOT1", "HSENDET", 1);
+    EsattoUnderTest driver(ESATTO_NAME);
+    ASSERT_TRUE(driver.connectTo(device.portName()));
+    checkLowProfileAtSensorUsesMinPos(driver, device);
 }
 
 TEST(EsattoTest, outerSensorIsRefused)
@@ -1724,6 +1826,49 @@ TEST(EsattoArcoTest, moveToCurrentPositionSendsNothing)
     auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
     ASSERT_TRUE(arco->connectTo(device.portName()));
     checkMoveToCurrentPositionSendsNothing(*arco, device);
+}
+
+TEST(EsattoArcoTest, lowProfileCalibratesWithExec)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    device.set("", "MODNAME", "ESATTO2LP");
+    device.set("MOT1", "ABS_POS_STEP", 203000);
+    auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
+    ASSERT_TRUE(arco->connectTo(device.portName()));
+    checkLowProfileCalibratesWithExec(*arco, device, true);
+}
+
+TEST(EsattoArcoTest, lowProfileExecWithoutCountIsAlert)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    device.set("", "MODNAME", "ESATTO2LP");
+    device.set("MOT1", "ABS_POS_STEP", 123569);
+    auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
+    ASSERT_TRUE(arco->connectTo(device.portName()));
+    checkLowProfileCalibratesWithExec(*arco, device, false);
+}
+
+TEST(EsattoArcoTest, otherModelAwayFromSensorIsRefused)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    device.set("", "MODNAME", "ESATTO2");
+    auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
+    ASSERT_TRUE(arco->connectTo(device.portName()));
+    checkOtherModelAwayFromSensorIsRefused(*arco, device);
+}
+
+TEST(EsattoArcoTest, lowProfileAtSensorUsesMinPos)
+{
+    FakePrimaLuce device;
+    ASSERT_FALSE(device.portName().empty());
+    device.set("", "MODNAME", "ESATTO2LP");
+    device.set("MOT1", "HSENDET", 1);
+    auto arco = makeDriver<ArcoUnderTest>(ARCO_NAME);
+    ASSERT_TRUE(arco->connectTo(device.portName()));
+    checkLowProfileAtSensorUsesMinPos(*arco, device);
 }
 
 TEST(EsattoArcoTest, outerSensorIsRefused)
